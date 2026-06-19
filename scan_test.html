@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Scan Test — Matrex</title>
+<!--
+  PURPOSE: diagnostic only. Reads PDF417 / QR / Code128 / DataMatrix and shows
+  the RAW decoded string + a delimiter-split preview. No parsing, no storage,
+  no upload. Engine strategy mirrors the real app:
+    Android Chrome -> native BarcodeDetector (ML Kit)
+    iPhone / other -> ZXing JS fallback (loaded on demand)
+  MUST be served over HTTPS (or localhost). Camera will not start otherwise.
+-->
+<style>
+:root{
+  --bg:#00293c;--surface:#00314a;--border:#004f7a;--border2:#005d8f;
+  --ink:#d8eef8;--muted:#4a89aa;--blue:#1ea8d4;--green:#22c97a;
+  --amber:#d4922a;--red:#e5484d;--mono:'Courier New',monospace;
+}
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+html,body{background:var(--bg);color:var(--ink);
+  font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;font-size:16px}
+.wrap{max-width:540px;margin:0 auto;padding:14px}
+h1{font-size:15px;font-weight:900;letter-spacing:2px;text-transform:uppercase;
+  color:#fff;margin-bottom:2px}
+.sub{font-size:11px;color:var(--muted);margin-bottom:12px}
+
+#engine{display:flex;align-items:center;gap:6px;background:var(--surface);
+  border:1px solid var(--border);border-radius:6px;padding:6px 10px;
+  font-size:11px;margin-bottom:10px}
+#engine .dot{width:7px;height:7px;border-radius:50%;background:var(--muted)}
+#engine.native .dot{background:var(--green)}
+#engine.fallback .dot{background:var(--amber)}
+#engine .val{margin-left:auto;color:var(--ink);font-weight:700}
+
+#cambox{position:relative;background:#000;border-radius:8px;overflow:hidden;
+  aspect-ratio:4/3;border:1px solid var(--border2);margin-bottom:12px}
+#cam{width:100%;height:100%;object-fit:cover;display:block}
+#camStatus{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+  text-align:center;padding:18px;background:rgba(0,34,51,.85);color:var(--muted);
+  font-size:13px;line-height:1.6}
+#camStatus.gone{display:none}
+
+.card{background:var(--surface);border:1px solid var(--border);border-radius:8px;
+  padding:12px;margin-bottom:12px}
+.lbl{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:1.2px;margin-bottom:6px}
+#raw{font-family:var(--mono);font-size:15px;color:var(--green);word-break:break-all;
+  white-space:pre-wrap;min-height:22px;line-height:1.5;user-select:all}
+.meta{font-size:11px;color:var(--muted);margin-top:8px}
+.copybtn{margin-top:10px;background:transparent;border:1px solid var(--blue);color:var(--blue);
+  border-radius:6px;padding:8px 14px;font-size:12px;font-weight:700;letter-spacing:1px;cursor:pointer}
+.copybtn:active{background:var(--blue);color:#fff}
+
+.delrow{display:flex;align-items:center;gap:8px;margin-bottom:10px}
+.delrow label{font-size:11px;color:var(--muted)}
+.delrow input{width:60px;background:var(--bg);border:1px solid var(--border2);color:var(--ink);
+  font-family:var(--mono);font-size:16px;text-align:center;padding:6px;border-radius:6px}
+.field{display:flex;gap:8px;padding:6px 0;border-bottom:1px solid rgba(0,79,122,.4);font-size:13px}
+.field:last-child{border-bottom:none}
+.fi{color:var(--blue);font-family:var(--mono);font-weight:700;min-width:22px}
+.fv{color:var(--ink);word-break:break-all}
+.fv.empty{color:var(--muted);font-style:italic}
+
+#hist .h{font-family:var(--mono);font-size:11px;color:var(--muted);
+  padding:5px 0;border-bottom:1px solid rgba(0,79,122,.3);word-break:break-all}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Scan Test</h1>
+  <div class="sub">Diagnostic — shows the raw barcode contents. Nothing is saved or uploaded.</div>
+
+  <div id="engine"><span class="dot"></span><span>Engine</span><span class="val" id="engineVal">starting…</span></div>
+
+  <div id="cambox">
+    <video id="cam" playsinline muted></video>
+    <div id="camStatus">Starting camera…</div>
+  </div>
+
+  <div class="card">
+    <div class="lbl">Raw decoded string</div>
+    <div id="raw">— point camera at a label —</div>
+    <div class="meta" id="rawMeta"></div>
+    <button class="copybtn" id="copyBtn">Copy raw</button>
+  </div>
+
+  <div class="card">
+    <div class="lbl">Split preview</div>
+    <div class="delrow">
+      <label>Delimiter</label>
+      <input id="delim" value="*" maxlength="3">
+      <span style="font-size:11px;color:var(--muted)">change to test other separators</span>
+    </div>
+    <div id="fields"><div class="field"><span class="fv empty">scan something first</span></div></div>
+  </div>
+
+  <div class="card">
+    <div class="lbl">Recent scans</div>
+    <div id="hist"></div>
+  </div>
+</div>
+
+<script>
+'use strict';
+const ZXING_CDN='https://cdn.jsdelivr.net/npm/@zxing/library@0.21.3/umd/index.min.js';
+const DEBOUNCE_MS=1500;
+const $=id=>document.getElementById(id);
+
+let stream=null,detPoll=null,zxReader=null;
+let lastCode='',lastAt=0,history=[];
+
+function setStatus(msg,err){
+  const el=$('camStatus');el.classList.remove('gone');
+  el.innerHTML=msg.replace(/\n/g,'<br>');
+  el.style.color=err?'var(--red)':'var(--muted)';
+}
+function setEngine(label,cls){$('engineVal').textContent=label;$('engine').className=cls||'';}
+
+function render(raw,fmt){
+  $('raw').textContent=raw;
+  $('rawMeta').textContent=(fmt?('Format: '+fmt+'  ·  '):'')+'Length: '+raw.length+' chars';
+  splitPreview(raw);
+  history.unshift({raw,fmt,t:new Date()});
+  history=history.slice(0,8);
+  $('hist').innerHTML=history.map(h=>
+    '<div class="h">'+h.t.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'})+
+    '  '+esc(h.raw)+'</div>').join('');
+}
+function splitPreview(raw){
+  const d=$('delim').value||'*';
+  const parts=raw.split(d);
+  $('fields').innerHTML=parts.map((p,i)=>
+    '<div class="field"><span class="fi">'+i+'</span><span class="fv'+(p?'':' empty')+'">'+
+    (p?esc(p):'(empty)')+'</span></div>').join('');
+}
+const esc=s=>String(s||'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+
+$('delim').addEventListener('input',()=>{const r=$('raw').textContent;if(r&&!r.startsWith('—'))splitPreview(r);});
+$('copyBtn').onclick=()=>{
+  const r=$('raw').textContent;
+  if(!r||r.startsWith('—'))return;
+  navigator.clipboard?.writeText(r).then(()=>{
+    $('copyBtn').textContent='Copied ✓';setTimeout(()=>$('copyBtn').textContent='Copy raw',1200);
+  });
+};
+
+function onDecode(raw,fmt){
+  raw=String(raw).trim();if(!raw)return;
+  const now=Date.now();
+  if(raw===lastCode&&now-lastAt<DEBOUNCE_MS){lastAt=now;return;}
+  lastCode=raw;lastAt=now;
+  if(navigator.vibrate)navigator.vibrate(50);
+  render(raw,fmt);
+}
+
+async function start(){
+  if(!window.isSecureContext){
+    setStatus('Page must be served over HTTPS (or localhost).\nCamera is blocked on plain http://',true);
+    return;
+  }
+  try{
+    stream=await navigator.mediaDevices.getUserMedia({
+      video:{facingMode:{ideal:'environment'},width:{ideal:1920},height:{ideal:1080}},audio:false
+    });
+  }catch(e){
+    setStatus('Camera blocked — allow camera access, then reload.',true);return;
+  }
+  const v=$('cam');v.srcObject=stream;await v.play();
+  $('camStatus').classList.add('gone');
+  tryNative();
+}
+
+async function tryNative(){
+  if(!('BarcodeDetector' in window)){loadZX();return;}
+  let supported=[];
+  try{supported=await window.BarcodeDetector.getSupportedFormats();}catch(e){}
+  const want=['pdf417','code_128','qr_code','data_matrix','ean_13'];
+  const formats=supported.filter(f=>want.includes(f));
+  if(!formats.length){loadZX();return;}
+  try{
+    const det=new window.BarcodeDetector({formats});
+    const v=$('cam');
+    detPoll=setInterval(async()=>{
+      if(v.readyState<2||v.paused)return;
+      try{
+        const res=await det.detect(v);
+        if(res.length)onDecode(res[0].rawValue,res[0].format);
+      }catch(e){}
+    },120);
+    setEngine('ML Kit native ('+formats.join(', ')+')','native');
+  }catch(e){loadZX();}
+}
+
+function loadZX(){
+  setStatus('Loading scanner library…');
+  const s=document.createElement('script');
+  s.src=ZXING_CDN;s.onload=startZX;
+  s.onerror=()=>setStatus('Scanner library failed to load — check internet, reload.',true);
+  document.head.appendChild(s);
+}
+function startZX(){
+  $('camStatus').classList.add('gone');
+  const v=$('cam');
+  const hints=new Map();
+  hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS,[
+    ZXing.BarcodeFormat.PDF_417,ZXing.BarcodeFormat.CODE_128,
+    ZXing.BarcodeFormat.QR_CODE,ZXing.BarcodeFormat.DATA_MATRIX]);
+  hints.set(ZXing.DecodeHintType.TRY_HARDER,true);
+  zxReader=new ZXing.BrowserMultiFormatReader(hints,DEBOUNCE_MS);
+  zxReader.decodeFromVideoElementContinuously(v,(result)=>{
+    if(!result)return;
+    let fmt='';
+    try{fmt=ZXing.BarcodeFormat[result.getBarcodeFormat()];}catch(e){}
+    onDecode(result.getText(),fmt);
+  });
+  setEngine('ZXing JS fallback','fallback');
+}
+
+start();
+</script>
+</body>
+</html>
